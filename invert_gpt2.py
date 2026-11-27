@@ -4,6 +4,12 @@ Embedding Inversion Script: GPT-2 Generator
 This script inverts text embeddings using GPT-2 as the language model for generation.
 The encoder model can be specified via command line parameter.
 
+Credit: the generator (learnable key-value offsets on dummy tokens, fluency loss,
+sentence-level updates, decoding constraints) is adapted from the implementation of
+"Zero-Shot Video Captioning by Evolving Pseudo-tokens" (Tewel et al., BMVC 2023),
+https://github.com/YoadTew/zero-shot-video-to-text, with CLIP replaced by a text
+embedding model scored against the target embedding.
+
 Usage:
     python invert_gpt2.py --encoder-model sentence-transformers/gtr-t5-base --dataset msmarco --max-samples 100
     python invert_gpt2.py --encoder-model sentence-transformers/all-MiniLM-L6-v2 --dataset /path/to/custom.csv
@@ -31,7 +37,9 @@ from transformers import (
 
 from SentenceTransformerWrapper import SentenceTransformerWrapper
 
+
 NOISE_BASE_SEED = 1_234_567
+
 
 def _deterministic_noise(dim, sample_id, device, dtype):
     """Reproducible Gaussian noise vector of length `dim` for one sample.
@@ -47,6 +55,7 @@ def _deterministic_noise(dim, sample_id, device, dtype):
     g = torch.Generator()
     g.manual_seed(NOISE_BASE_SEED + int(sample_id))
     return torch.randn(dim, generator=g).to(device=device, dtype=dtype)
+
 
 class NoisySentenceTransformerWrapper(SentenceTransformerWrapper):
     """SentenceTransformerWrapper that can inject Gaussian noise into embeddings.
@@ -77,8 +86,18 @@ class NoisySentenceTransformerWrapper(SentenceTransformerWrapper):
             embs = F.normalize(embs, p=2, dim=-1)
         return embs
 
+
+# =============================================================================
+# CONFIGURATION (Generator is hardcoded, encoder is parameterized)
+# =============================================================================
+
 DEFAULT_ENCODER = "sentence-transformers/gtr-t5-base"
 HARDCODED_GENERATOR = "gpt2-medium"
+
+
+# =============================================================================
+# GENERATOR CLASS
+# =============================================================================
 
 class Generator:
     def __init__(
@@ -115,6 +134,7 @@ class Generator:
         self.seed = seed
         self.reset_random_seed()
 
+        # Initialize language model
         self.lm_tokenizer = AutoTokenizer.from_pretrained(generator_model)
         self.generator_model = AutoModelForCausalLM.from_pretrained(
             generator_model,
@@ -128,11 +148,13 @@ class Generator:
         if self.lm_tokenizer.pad_token is None:
             self.lm_tokenizer.pad_token = self.lm_tokenizer.eos_token
 
+        # Determine start token
         if self.lm_tokenizer.bos_token_id is not None:
             self.start_token_id = self.lm_tokenizer.bos_token_id
         else:
             self.start_token_id = self.lm_tokenizer.eos_token_id
 
+        # KV cache initialization
         self.num_dummy_tokens = num_dummy_tokens
         if dummy_starter:
             starter_token_ids = self.lm_tokenizer.encode(dummy_starter, add_special_tokens=False)
@@ -152,6 +174,7 @@ class Generator:
             self.dummy_context_init = self.generator_model(dummy_tokens)["past_key_values"]
 
         num_layers = len(self.dummy_context_init)
+        # Determine which layers get learnable offsets
         if kv_layers is None:
             self.trainable_layers = set(range(num_layers))  # all layers
         else:
@@ -185,9 +208,11 @@ class Generator:
             weight_decay=learning_rate * weight_decay_scale,
         )
 
+        # End token (used for early stopping)
         end_token_ids = self.lm_tokenizer.encode(".", add_special_tokens=False)
         self.end_token = end_token_ids[0] if end_token_ids else self.lm_tokenizer.eos_token_id
 
+        # Repetition penalties
         self.deter_small_repeat = RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty)
         self.prevent_large_repeat = NoRepeatNGramLogitsProcessor(ngram_size=2)
 
@@ -197,6 +222,7 @@ class Generator:
             eos_token_id=self.end_token
         )
 
+        # Token mappings and penalties
         self.token_to_similar_indices = self._build_similar_token_mapping()
         self.first_token_offset, self.other_token_offset = self._build_token_specific_penalties(entity_penalty)
         self.short_token_penalty = self._build_short_token_penalty(short_token_penalty, min_token_length)
@@ -208,8 +234,10 @@ class Generator:
         # Token boost: set externally by main() via generator.token_boost = ...
         self.token_boost = None
 
+        # Best runs tracking
         self.best_runs = [{"score": 0, "reconstruction": None, "kv_state": None} for _ in range(10)]
 
+        # Per-sample encoder embedding cache: {sentence: embedding_tensor}
         # Populated during get_similarity_loss and reused across iterations to
         # avoid re-encoding candidates the beam has already seen. Cleared when
         # a new Generator is created (one per sample).
@@ -217,6 +245,7 @@ class Generator:
         self._emb_cache_hits = 0
         self._emb_cache_misses = 0
 
+        # Store params
         self.target_seq_max_length = target_seq_max_length
         self.sentence_iterations = sentence_iterations
         self.sampling_top_k = sampling_top_k
@@ -343,6 +372,7 @@ class Generator:
         history_similar = history_similar.view(history_tokens.size(0), -1)
         logits = self.deter_small_repeat(history_similar, logits)
 
+        # 2. Exact n-gram repetition penalty
         logits = self.prevent_large_repeat(generated_tokens, logits)
 
         # 3. Prevent premature EOS (using MinLengthLogitsProcessor)
@@ -354,6 +384,7 @@ class Generator:
         else:
             logits = logits + self.other_token_offset.unsqueeze(0)
 
+        # 5. Short token penalty
         logits = logits + self.short_token_penalty.unsqueeze(0)
 
         # 6. Token boost (names, terms from embedding similarity)
@@ -375,6 +406,7 @@ class Generator:
             else:
                 logits = logits + self.token_boost.unsqueeze(0)
 
+        # 7. Numerical stability guard
         logits = logits.masked_fill(torch.isnan(logits), float("-inf"))
 
         return logits
@@ -450,10 +482,13 @@ class Generator:
         Returns:
             Next token ID [batch_size, 1]
         """
+        # Apply all constraints and penalties
         logits = self.tinker_logits(logits, generated_tokens, first_token)
 
+        # Narrow down to top k options
         option_logits, next_token_options = logits.topk(sampling_top_k, dim=-1)
 
+        # Convert to probabilities and sample
         top_probs = F.softmax(option_logits, dim=-1) + 1e-10
         next_token_index = torch.multinomial(top_probs, num_samples=1)[0]
         next_token_id = next_token_options[:, next_token_index]
@@ -503,6 +538,7 @@ class Generator:
                 fluency_loss = -(unshifted_probs * probs.log()).sum()
                 fluency_losses.append(fluency_loss)
 
+                # Similarity loss
                 cls_loss = self.get_similarity_loss(target_embedding, logits, generated_tokens)
                 similarity_losses.append(cls_loss)
 
@@ -519,6 +555,7 @@ class Generator:
             if next_token.item() == self.end_token:
                 break
 
+        # Loss aggregation
         n_loss_steps = len(fluency_losses) if fluency_losses else 1
         if self.loss_aggregation == "sum":
             final_fluency_loss = sum(fluency_losses) if fluency_losses else torch.tensor(0.0, device=self.device)
@@ -530,6 +567,7 @@ class Generator:
         total_loss = self.fluency_loss_scale * final_fluency_loss + self.cls_loss_scale * final_similarity_loss
 
         # Final similarity (use cache: this text will often reappear as a
+        # candidate in later iterations' top-k)
         text = self.lm_tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         final_text = text[0]
         if final_text in self._emb_cache:
@@ -548,6 +586,7 @@ class Generator:
         loss_val = total_loss.item() if hasattr(total_loss, "item") else total_loss
         print(f"Loss: {loss_val:.4f} (flu: {flu_val:.2f}, sim: {sim_val:.2f}) | Similarity: {final_similarity.item():.4f} | {text}")
 
+        # Backpropagation
         total_loss.backward()
         self.dummy_optimizer.step()
         self.dummy_optimizer.zero_grad()
@@ -601,6 +640,7 @@ class Generator:
         input_expanded = target_embedding.detach().cpu()[0].unsqueeze(0)
         ground_truth_logits = F.cosine_similarity(input_expanded, cls_representations, dim=1)
 
+        # Create target distribution from similarities
         ground_truth_distr = F.softmax(ground_truth_logits / self.similarity_temperature, dim=0)
 
         # Get model's distribution over the candidate tokens
@@ -624,7 +664,9 @@ class Generator:
                 candidates = []
 
                 for beam_ids, _ in beams:
+                    # Use learned KV cache
                     logits = self.generator_model(beam_ids, past_key_values=self.dummy_context).logits[:, -1, :]
+                    # Apply constraints on CPU
                     logits_cpu = self.tinker_logits(logits.cpu(), beam_ids.cpu())
                     _, top_tokens = logits_cpu.topk(top_k, dim=-1)
 
@@ -654,6 +696,7 @@ class Generator:
                     sim = F.cosine_similarity(emb.unsqueeze(0), target_cpu).item()
                     scored.append((ids, sim))
 
+                # Keep top beams
                 scored.sort(key=lambda x: x[1], reverse=True)
                 beams = scored[:beam_size]
 
@@ -666,6 +709,11 @@ class Generator:
             best_text = self.lm_tokenizer.decode(best_ids[0], skip_special_tokens=True)
             return best_text, best_score
 
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
 def load_texts_from_csv(csv_path, text_column="text", limit=None):
     """Load texts from a CSV file."""
     df = pd.read_csv(csv_path)
@@ -675,6 +723,7 @@ def load_texts_from_csv(csv_path, text_column="text", limit=None):
     if limit:
         texts = texts[:limit]
     return texts
+
 
 def get_dataset_path(dataset_name):
     """Get the path to a dataset CSV file."""
@@ -696,13 +745,20 @@ def get_dataset_path(dataset_name):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}. Available: {list(dataset_map.keys())}")
 
+
 def get_encoder_short_name(encoder_model):
     """Extract a short name from encoder model path for file naming."""
     name = encoder_model.split("/")[-1]
+    # Remove common prefixes/suffixes for cleaner names
     for prefix in ["sentence-transformers-", "sentence-transformers_"]:
         if name.startswith(prefix):
             name = name[len(prefix):]
     return name
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -710,6 +766,7 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
+    # Encoder model (parameterized)
     parser.add_argument("--encoder-model", type=str, default=DEFAULT_ENCODER,
                         help="Encoder model (sentence-transformers compatible)")
     parser.add_argument("--use-query-prompt", action="store_true",
@@ -717,13 +774,16 @@ def parse_args():
     parser.add_argument("--trust-remote-code", action="store_true",
                         help="Trust remote code when loading encoder model")
 
+    # Dataset
     parser.add_argument("--dataset", type=str, required=True, help="Dataset name or path to CSV")
     parser.add_argument("--text-column", type=str, default="text", help="Text column name in CSV")
     parser.add_argument("--max-samples", type=int, default=None, help="Max samples to process")
     parser.add_argument("--skip-samples", type=int, default=0, help="Skip first N samples")
 
+    # Output
     parser.add_argument("--output", type=str, default="outputs", help="Output directory")
 
+    # Phase 1
     parser.add_argument("--sentence-iterations", type=int, default=150, help="KV optimization iterations")
     parser.add_argument("--max-sentence-length", type=int, default=32,
                         help="Max number of tokens to generate per reconstruction (Phase 1)")
@@ -736,6 +796,7 @@ def parse_args():
     parser.add_argument("--learning-rate", type=float, default=0.02, help="Learning rate")
     parser.add_argument("--sampling-top-k", type=int, default=50, help="Top-k sampling")
 
+    # Loss
     parser.add_argument("--cls-loss-scale", type=float, default=1.0, help="Similarity loss scale")
     parser.add_argument("--fluency-loss-scale", type=float, default=1.0, help="Fluency loss scale")
     parser.add_argument("--loss-aggregation", type=str, default="mean", choices=["mean", "sum"])
@@ -743,19 +804,23 @@ def parse_args():
     parser.add_argument("--num-loss-computations", type=int, default=3,
                         help="Number of loss computations per generation (evenly spaced)")
 
+    # KV layer selection
     parser.add_argument("--kv-layers", type=str, default=None,
                         help="Which layers to train KV offsets for. "
                              "Format: '6-20' (range), '8,10,12,14' (list), or 'middle' (auto). "
                              "Default: all layers. GPT-2 medium has 24 layers (0-23).")
 
+    # Boost dedup (case/whitespace variants via token_to_similar_indices)
     parser.add_argument("--no-boost-dedup", action="store_true",
                         help="Disable dedup of boosted tokens. "
                              "By default, once 'CPR' is used, ' CPR'/'cpr'/'CPR' lose boost.")
 
+    # Penalties
     parser.add_argument("--entity-penalty", type=float, default=5, help="Entity token penalty (low to allow names)")
     parser.add_argument("--short-token-penalty", type=float, default=30, help="Short token penalty")
     parser.add_argument("--min-token-length", type=int, default=2, help="Min token length")
 
+    # Token boost (from knowledge bank)
     parser.add_argument("--boost-strength", type=float, default=3.0,
                         help="Logit boost strength (0=disable)")
     parser.add_argument("--num-boost-tokens", type=int, default=20,
@@ -775,6 +840,7 @@ def parse_args():
     parser.add_argument("--no-vocab-boost-mask", action="store_false", dest="vocab_boost_mask",
                         help="Disable [MASK] prefix for vocab boost embeddings")
 
+    # Phase 2
     parser.add_argument("--enable-beam-search", action="store_true",
                         help="Enable Phase 2 beam search refinement (disabled by default)")
     parser.add_argument("--refine-top-n", type=int, default=5, help="Top N to refine")
@@ -782,17 +848,20 @@ def parse_args():
     parser.add_argument("--beam-top-k", type=int, default=30, help="Beam top-k")
     parser.add_argument("--beam-max-tokens", type=int, default=35, help="Beam max tokens")
 
+    # Other
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--checkpoint-interval", type=int, default=10, help="Checkpoint every N samples")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from the latest checkpoint in output directory")
 
+    # Noise injection
     parser.add_argument('--noise-level', type=float, default=0.0,
                         help="Noise level for embedding perturbation (default: 0.0)")
     parser.add_argument('--noise-levels', type=float, nargs='+', default=None,
                         help="Sweep multiple noise levels (e.g., --noise-levels 0.001 0.01 0.1)")
 
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
@@ -812,6 +881,7 @@ def main():
     kv_layers = None
     if args.kv_layers:
         if args.kv_layers == 'middle':
+            # Auto-detect num_layers from the model config
             from transformers import AutoConfig
             cfg = AutoConfig.from_pretrained(HARDCODED_GENERATOR)
             n = cfg.n_layer if hasattr(cfg, 'n_layer') else cfg.num_hidden_layers
@@ -830,6 +900,7 @@ def main():
     # a directory and use the dataset-derived auto-naming inside it. This avoids
     # the old footgun where `--output .../foo.csv` mkdir'd `foo.csv/` as a
     # directory and wrote a timestamped file inside (or errored if foo.csv
+    # already existed as a file).
     _out_arg = Path(args.output)
     if _out_arg.suffix.lower() == ".csv":
         output_dir = _out_arg.parent
@@ -839,6 +910,7 @@ def main():
         output_file_override = None
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Load dataset
     csv_path = get_dataset_path(args.dataset)
     print(f"Loading texts from: {csv_path}")
     texts = load_texts_from_csv(csv_path, text_column=args.text_column)
@@ -846,6 +918,7 @@ def main():
 
     dataset_name = os.path.splitext(os.path.basename(csv_path))[0]
 
+    # Initialize encoder
     if args.encoder_model == 'azure-openai':
         from azure_encoder import AzureOpenAIEncoder
         encoder = AzureOpenAIEncoder(
@@ -863,6 +936,7 @@ def main():
         encoder_short_name = get_encoder_short_name(args.encoder_model)
     generator_name = HARDCODED_GENERATOR.split("/")[-1]
 
+    # Initialize token boost
     retriever = None
     vocab_embeddings = None
     _lm_tokenizer = AutoTokenizer.from_pretrained(HARDCODED_GENERATOR)
@@ -900,11 +974,15 @@ def main():
             print(f"  Vocab embeddings: {vocab_embeddings.shape} ({sum(vocab_valid)} valid tokens)")
             encoder.reset_token_count()
         else:
+            # Knowledge bank retriever
             print("\n[Initializing attribute retriever for token boost]")
             from knowledge_bank.retriever import AttributeRetriever
             retriever = AttributeRetriever(args.encoder_model)
         encoder.reset_token_count()
 
+    # =========================================================================
+    # Sweep over noise levels
+    # =========================================================================
     for noise_level in noise_levels:
         encoder.noise_level = noise_level
         noise_tag = f"_noise{noise_level}"
@@ -914,6 +992,9 @@ def main():
             print(f"# Noise Level: {noise_level}")
             print(f"{'#'*80}")
 
+        # =====================================================================
+        # Handle resume logic
+        # =====================================================================
         reconstructions = []
         start_idx = args.skip_samples
 
@@ -936,6 +1017,7 @@ def main():
         elif args.skip_samples > 0:
             print(f"Skipping first {args.skip_samples} samples")
 
+        # Prepare texts to process
         texts_to_process = texts[start_idx:]
 
         if args.max_samples:
@@ -956,6 +1038,7 @@ def main():
             print(f"Sample {actual_idx}: {text[:100]}...")
             print(f"{'='*80}")
 
+            # Reset token counter for this sample
             encoder.reset_token_count()
 
             if args.use_query_prompt:
@@ -992,8 +1075,10 @@ def main():
                 boost_dedup=not args.no_boost_dedup,
             )
 
+            # Build token boost
             sample_retrieved_json = ""
             if vocab_embeddings is not None:
+                # Direct vocab boost mode
                 t_emb = target_embedding.detach().cpu()
                 if t_emb.dim() == 2:
                     t_emb = t_emb[0]
@@ -1055,6 +1140,7 @@ def main():
                 if retrieved_attrs:
                     sample_retrieved_json = _json.dumps(retrieved_attrs)
 
+            # Phase 1
             print("\n" + "=" * 60)
             print("PHASE 1: KV cache optimization")
             print("=" * 60)
@@ -1065,6 +1151,7 @@ def main():
             print(f"Phase 1 (KV) tokens: {kv_tokens}")
             encoder.reset_token_count()
 
+            # Phase 2 (optional)
             refined_results = []
             beam_tokens = 0
             if args.enable_beam_search:
@@ -1086,6 +1173,7 @@ def main():
                     refined_results.append({"reconstruction": refined_text, "score": score})
                     generator.restore_kv_state(prev_state)
 
+                # Get Phase 2 token count
                 beam_tokens = encoder.get_token_count()
                 print(f"Phase 2 (Beam) tokens: {beam_tokens}")
             else:
@@ -1093,6 +1181,7 @@ def main():
 
             print(f"Total tokens: {kv_tokens + beam_tokens}")
 
+            # Combine results
             phase1_texts = [run["reconstruction"] for run in best_runs[:10] if run["reconstruction"]]
             phase1_scores = [
                 run["score"].item() if hasattr(run["score"], "item") else run["score"]
@@ -1104,6 +1193,7 @@ def main():
 
             reconstructions.append((actual_idx, text, phase1_texts, phase1_scores, phase2_texts, phase2_scores, kv_tokens, beam_tokens, noise_level, sample_retrieved_json))
 
+            # Checkpoint
             if len(reconstructions) % args.checkpoint_interval == 0:
                 checkpoint_file = output_dir / f"{dataset_name}_{generator_name}_{encoder_short_name}{noise_tag}_checkpoint_{len(reconstructions)}.csv"
                 _save_results(checkpoint_file, reconstructions, args.refine_top_n)
@@ -1130,6 +1220,7 @@ def main():
         if ckpts:
             print(f"[cleanup] removed {len(ckpts)} checkpoint file(s) matching {ckpt_pattern}")
 
+
 def _save_results(filepath, reconstructions, refine_top_n):
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f, quoting=csv.QUOTE_ALL)
@@ -1152,6 +1243,7 @@ def _save_results(filepath, reconstructions, refine_top_n):
             row += [kv_tokens, beam_tokens, nl, retrieved_json]
             writer.writerow(row)
 
+
 def _load_results(filepath, refine_top_n):
     """Load results from a CSV checkpoint file."""
     reconstructions = []
@@ -1170,6 +1262,7 @@ def _load_results(filepath, refine_top_n):
             retrieved_json = row.get('retrieved_attributes', '')
             reconstructions.append((row_id, text, p1_texts, p1_scores, p2_texts, p2_scores, kv_tokens, beam_tokens, nl, retrieved_json))
     return reconstructions
+
 
 def _find_latest_checkpoint(output_dir, dataset_name, generator_name, encoder_short_name, noise_level=0.0):
     """Find the latest checkpoint file matching the current configuration."""
@@ -1195,6 +1288,7 @@ def _find_latest_checkpoint(output_dir, dataset_name, generator_name, encoder_sh
     latest_num, latest_file = checkpoint_info[0]
 
     return latest_file, latest_num
+
 
 if __name__ == "__main__":
     main()

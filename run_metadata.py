@@ -9,6 +9,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 METADATA_DIR = REPO_ROOT / "run_metadata"
 
+
 def _git_commit():
     try:
         return subprocess.check_output(
@@ -17,6 +18,7 @@ def _git_commit():
         ).strip()
     except Exception:
         return None
+
 
 def _serialize_args(args):
     if args is None:
@@ -31,8 +33,10 @@ def _serialize_args(args):
             out[k] = repr(v)
     return out
 
+
 def _ts_for_filename(iso: str) -> str:
     return iso.replace(":", "").replace("-", "").replace("+00:00", "Z").replace(".", "")
+
 
 def track_experiment(output_path, args=None, extra=None):
     started_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")

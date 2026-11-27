@@ -1,12 +1,15 @@
 # secrets -- never commit
 .env
 *.key
+azure_encoder.py
 
 # data derived from MIMIC (PhysioNet DUA: not redistributable)
 dataset_csvs/
 outputs/
 out/
 run_metadata/
+mimic-iv/
+adjudication/
 
 # python
 __pycache__/

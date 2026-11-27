@@ -11,6 +11,7 @@ case/whitespace variants are already in the seed sentence, forcing the search
 to propose genuinely new vocabulary rather than reallocating existing tokens.
 
 Usage:
+    # On Phase-1 c1 output
     python hill_climb.py --input outputs/ours/newer/mimic/contriever.csv \\
         --output outputs/ours/newer/mimic/contriever_hc.csv \\
         --column c1 --target-column source_text --encoder contriever
@@ -34,6 +35,7 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer
 
+
 ENCODERS = {
     'gte': 'thenlper/gte-base',
     'gte-qwen': 'Alibaba-NLP/gte-Qwen2-1.5B-instruct',
@@ -41,7 +43,9 @@ ENCODERS = {
     'contriever': 'facebook/contriever',
 }
 
+
 NOISE_BASE_SEED = 1_234_567
+
 
 def _deterministic_noise(dim, sample_id, device, dtype):
     """Reproducible Gaussian noise vector of length `dim` for one sample.
@@ -57,6 +61,7 @@ def _deterministic_noise(dim, sample_id, device, dtype):
     g.manual_seed(NOISE_BASE_SEED + int(sample_id))
     return torch.randn(dim, generator=g).to(device=device, dtype=dtype)
 
+
 def count_encoder_tokens(encoder, texts):
     """Count how many tokens `texts` would occupy in the encoder's tokenizer.
 
@@ -67,6 +72,11 @@ def count_encoder_tokens(encoder, texts):
         texts = [texts]
     tokenizer = encoder.tokenizer
     return sum(len(tokenizer.encode(str(t), add_special_tokens=True)) for t in texts)
+
+
+# =============================================================================
+# VOCAB + TOKEN MAPPING SETUP (shared with invert_gpt2 pattern)
+# =============================================================================
 
 def build_vocab_embeddings(encoder, tokenizer, min_token_length=4, batch_size=512,
                            use_mask=True, word_initial_only=True):
@@ -134,6 +144,7 @@ def build_vocab_embeddings(encoder, tokenizer, min_token_length=4, batch_size=51
     print(f"    word_initial tokens in raw vocab: {n_word_initial}/{vocab_size}")
     return vocab_embeddings, vocab_decoded, vocab_valid
 
+
 def build_similar_token_mapping(tokenizer, vocab_size, max_similar=8):
     """Group tokens by normalized form (case/whitespace variants).
 
@@ -162,6 +173,11 @@ def build_similar_token_mapping(tokenizer, vocab_size, max_similar=8):
 
     return mapping
 
+
+# =============================================================================
+# HILL-CLIMB CORE
+# =============================================================================
+
 def _compute_llm_candidates(llm_model, tokens, pool_size, vocab_valid_mask):
     with torch.no_grad():
         input_ids = torch.tensor([tokens], device=llm_model.device)
@@ -189,6 +205,7 @@ def _compute_llm_candidates(llm_model, tokens, pool_size, vocab_valid_mask):
         pos_logits[invalid] = float("-inf")
         per_pos.append(pos_logits.topk(k).indices.tolist())
     return per_pos
+
 
 def hill_climb(encoder, tokenizer, target_emb, seed_text,
                vocab_embeddings, similar_mapping,
@@ -425,6 +442,11 @@ def hill_climb(encoder, tokenizer, target_emb, seed_text,
     if verbose:
         print(f"  [hill-climb] encoder tokens spent inside hill-climb: {tokens_spent[0]}")
     return final_text, current_sim, tokens_spent[0]
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(
@@ -719,6 +741,7 @@ def main():
         print(f"Mean tokens/sample:        {total_tokens_spent/n_done:.0f}")
         print(f"Total encoder tokens:      {total_tokens_spent}  "
               f"(not counting one-time vocab pre-encoding)")
+
 
 if __name__ == '__main__':
     main()

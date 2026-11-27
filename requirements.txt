@@ -1,15 +1,7 @@
+# The reported runs used torch 2.5, transformers 4.46 and sentence-transformers 3.1.1.
 torch
 transformers
 sentence-transformers
 pandas
 tqdm
-nltk
-requests
-tiktoken
-numpy
-anthropic
-python-dotenv
-faker
-pycountry
-peft
-cma
+datasets

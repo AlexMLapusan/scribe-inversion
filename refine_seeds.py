@@ -26,6 +26,10 @@ from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+
+# =============================================================================
+# ENCODER MAPPING
+# =============================================================================
 ENCODERS = {
     'gte': 'thenlper/gte-base',
     'gte-qwen': 'Alibaba-NLP/gte-Qwen2-1.5B-instruct',
@@ -34,6 +38,10 @@ ENCODERS = {
     'azure-openai': 'text-embedding-3-small',
 }
 
+
+# =============================================================================
+# DATA STRUCTURES
+# =============================================================================
 @dataclass
 class Candidate:
     """Represents one beam-search candidate."""
@@ -42,7 +50,12 @@ class Candidate:
     seq_str: str = ""
     cos_sim: float = 0.0
 
+
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 NOISE_BASE_SEED = 1_234_567
+
 
 def _deterministic_noise(dim, sample_id, device, dtype):
     """Reproducible Gaussian noise vector of length `dim` for one sample.
@@ -57,6 +70,7 @@ def _deterministic_noise(dim, sample_id, device, dtype):
     g = torch.Generator()
     g.manual_seed(NOISE_BASE_SEED + int(sample_id))
     return torch.randn(dim, generator=g).to(device=device, dtype=dtype)
+
 
 def count_tokens(encoder, texts):
     """Count tokens for a list of texts using the encoder's tokenizer."""
@@ -73,12 +87,15 @@ def count_tokens(encoder, texts):
         total += len(tokens)
     return total
 
+
 def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 50, top_p: float = 1.0) -> torch.Tensor:
     """Filter tokens by top-k and top-p constraints."""
     probs = torch.softmax(logits, dim=-1)
 
+    # Top-K filtering
     topk_probs, topk_indices = torch.topk(probs, min(top_k, probs.size(-1)))
 
+    # Top-P (nucleus) filtering
     sorted_probs, sorted_indices = torch.sort(probs, descending=True)
     cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
     top_p_cutoff = torch.sum(cumulative_probs <= top_p).item()
@@ -86,6 +103,7 @@ def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 50, top_p: float = 
         top_p_cutoff = 1
     top_p_indices = sorted_indices[:top_p_cutoff]
 
+    # Intersection of top-k and top-p
     top_k_set = set(topk_indices.tolist())
     top_p_set = set(top_p_indices.tolist())
     intersection_set = top_k_set.intersection(top_p_set)
@@ -100,6 +118,10 @@ def top_k_top_p_filtering(logits: torch.Tensor, top_k: int = 50, top_p: float = 
 
     return intersection_indices
 
+
+# =============================================================================
+# COSINE SIMILARITY SCORER
+# =============================================================================
 class CosineSimilarityScorer:
     """Scores candidates by cosine similarity with target embedding."""
 
@@ -123,6 +145,7 @@ class CosineSimilarityScorer:
 
         texts = [c.seq_str for c in candidates]
 
+        # Count tokens before encoding
         self.total_tokens_embedded += count_tokens(self.encoder, texts)
 
         embeddings = self.encoder.encode(
@@ -140,6 +163,10 @@ class CosineSimilarityScorer:
 
         return cos_sims
 
+
+# =============================================================================
+# LLM WRAPPER
+# =============================================================================
 class LLMWrapper:
     """Wrapper for LLM that generates next-token proposals."""
 
@@ -231,6 +258,7 @@ class LLMWrapper:
             last_pos = len(inp) - 1
             logits_list.append(outputs.logits[i, last_pos, :])
 
+        # Mask special tokens
         special_tokens_to_mask = []
         for special in ['<|im_end|>', '<|end_header_id|>', '<|start_header_id|>',
                        '<|eot_id|>', '<|eom_id|>', '<|python_tag|>']:
@@ -266,6 +294,10 @@ class LLMWrapper:
 
         return results
 
+
+# =============================================================================
+# BEAM SEARCH
+# =============================================================================
 class BeamSearch:
     """Beam search with cosine similarity scoring."""
 
@@ -335,6 +367,10 @@ class BeamSearch:
             return best_full_candidate
         return candidates[0]
 
+
+# =============================================================================
+# SEED REFINER
+# =============================================================================
 REFINE_SYSTEM_PROMPT = (
     "You reconstruct original sentences from noisy copies. "
     "Output only the reconstructed sentence. "
@@ -351,6 +387,7 @@ REFINE_FEW_SHOT = [(
     "Reconstructed sentence:",
     "Robert Chen, 62, admitted with acute myocardial infarction and type 2 diabetes, started on heparin drip and insulin protocol in the cardiac ICU."
 )]
+
 
 class SeedRefiner:
     """
@@ -399,8 +436,10 @@ class SeedRefiner:
     def _clean_output(text: str) -> str:
         """Strip quotes and artifacts from beam search output."""
         text = text.strip()
+        # Strip wrapping quotes
         if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
             text = text[1:-1].strip()
+        # Strip leading quote if present
         if text.startswith('"') or text.startswith("'"):
             text = text[1:].strip()
         return text
@@ -476,6 +515,10 @@ class SeedRefiner:
         total_tokens = scorer.get_token_count()
         return best_result_text, best_result_score, total_tokens
 
+
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
     parser = argparse.ArgumentParser(
         description="Refine seed texts via LLM-guided beam search",
@@ -489,6 +532,7 @@ Examples:
         """
     )
 
+    # Input/Output
     parser.add_argument('--input', type=str, required=True,
                         help="Input CSV file path")
     parser.add_argument('--column', type=str, default=None,
@@ -508,11 +552,13 @@ Examples:
     parser.add_argument('--score-column', type=str, default='refined_cos_sim',
                         help="Name for the output similarity score column (default: refined_cos_sim)")
 
+    # Model selection
     parser.add_argument('--encoder', type=str, default='gte',
                         help="Encoder model: gte, gte-qwen, gtr, contriever, azure-openai, or full HuggingFace path (default: gte)")
     parser.add_argument('--llm', type=str, default='Qwen/Qwen2.5-0.5B-Instruct',
                         help="LLM for token generation (default: Qwen/Qwen2.5-0.5B-Instruct)")
 
+    # Algorithm parameters
     parser.add_argument('--beam-width', type=int, default=30,
                         help="Beam width (default: 30)")
     parser.add_argument('--top-k', type=int, default=30,
@@ -550,6 +596,7 @@ Examples:
     parser.add_argument('--print-boost-top-k', type=int, default=15,
                         help="How many top boosted tokens to print per sample (0=disable)")
 
+    # Processing options
     parser.add_argument('--max-samples', type=int, default=None,
                         help="Max number of samples to process")
     parser.add_argument('--skip-samples', type=int, default=0,
@@ -557,6 +604,7 @@ Examples:
     parser.add_argument('--checkpoint-interval', type=int, default=10,
                         help="Save checkpoint every N samples (default: 10)")
 
+    # Hardware
     parser.add_argument('--device', type=str, default='cuda:0',
                         help="Device for computation (default: cuda:0)")
 
@@ -564,6 +612,7 @@ Examples:
                         help="Gaussian sigma added to the target embedding (defense "
                              "simulation, matches the ZSInvert noise threat model).")
 
+    # Misc
     parser.add_argument('--verbose', action='store_true',
                         help="Print detailed progress")
 
@@ -572,6 +621,9 @@ Examples:
     from run_metadata import track_experiment
     track_experiment(args.output, args)
 
+    # =========================================================================
+    # Validate column args
+    # =========================================================================
     if not args.column and not args.seed_columns:
         parser.error("Either --column or --seed-columns is required")
     if args.column and args.seed_columns:
@@ -585,6 +637,9 @@ Examples:
         primary_column = args.column
         extra_columns = []
 
+    # =========================================================================
+    # Load CSV (resume-aware: prefer existing output if --resume)
+    # =========================================================================
     resume_source = None
     if args.resume and args.output and os.path.exists(args.output):
         resume_source = args.output
@@ -609,11 +664,15 @@ Examples:
     if target_column not in df.columns:
         raise ValueError(f"Target column '{target_column}' not found. Available: {list(df.columns)}")
 
+    # Apply skip and max samples
     start_idx = args.skip_samples
     end_idx = len(df) if args.max_samples is None else min(start_idx + args.max_samples, len(df))
 
     print(f"Processing rows {start_idx} to {end_idx - 1}")
 
+    # =========================================================================
+    # Load models
+    # =========================================================================
     print("\n[Loading Encoder]")
     if args.encoder in ENCODERS:
         encoder_name = ENCODERS[args.encoder]
@@ -648,6 +707,9 @@ Examples:
     else:
         llm_wrapper = LLMWrapper(model, tokenizer, device=args.device)
 
+    # =========================================================================
+    # Create refiner
+    # =========================================================================
     refiner = SeedRefiner(
         encoder=encoder,
         llm_wrapper=llm_wrapper,
@@ -658,6 +720,9 @@ Examples:
         n_iter=args.n_iter
     )
 
+    # =========================================================================
+    # Print configuration
+    # =========================================================================
     print("\n" + "=" * 80)
     print("Seed Refinement Configuration")
     print("=" * 80)
@@ -674,6 +739,9 @@ Examples:
     print(f"Output columns: {args.refined_column}, {args.score_column}")
     print("=" * 80)
 
+    # =========================================================================
+    # Pre-compute target embeddings
+    # =========================================================================
     print("\n[Pre-computing target embeddings]")
     target_texts = df[target_column].iloc[start_idx:end_idx].tolist()
 
@@ -698,6 +766,9 @@ Examples:
         print(f"  Applied deterministic per-sample Gaussian noise (sigma={args.noise_level}) + re-normalized target embeddings")
     print(f"  Computed {len(target_embeddings)} embeddings")
 
+    # =========================================================================
+    # Initialize output columns if they don't exist
+    # =========================================================================
     if args.refined_column not in df.columns:
         df[args.refined_column] = None
     if args.score_column not in df.columns:
@@ -705,11 +776,17 @@ Examples:
     if 'refined_tokens' not in df.columns:
         df['refined_tokens'] = None
 
+    # =========================================================================
+    # Run refinement
+    # =========================================================================
     print("\n[Running Refinement]")
 
     output_path = args.output if args.output else args.input
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
+    # =========================================================================
+    # Initialize boost: knowledge bank retriever and/or vocab embeddings
+    # =========================================================================
     retriever = None
     vocab_embeddings = None
     vocab_decoded = None  # parallel list of decoded token strings (for printing)
@@ -765,9 +842,13 @@ Examples:
 
         seed_text = str(seed_text)
 
+        # ================================================================
+        # Build per-sample token boost (vocab / bank / both)
+        # ================================================================
         sample_boost = None
         sims_vocab = None  # cached for printing later
         if args.boost_strength > 0:
+            # Vocab boost
             if vocab_embeddings is not None:
                 t_emb = target_embedding.detach().cpu()
                 if t_emb.dim() == 2:
@@ -816,6 +897,9 @@ Examples:
             if not pd.isna(val) and str(val).strip():
                 extra_seeds.append(str(val))
 
+        # ================================================================
+        # Tracking: compute seed similarity for delta reporting
+        # ================================================================
         with torch.no_grad():
             seed_emb = encoder.encode(
                 [seed_text], convert_to_tensor=True,
@@ -867,13 +951,20 @@ Examples:
         print(f"  Refined: {refined_text[:90]}")
         print(f"           sim={cos_sim:.4f}  {delta_marker} Δ={delta:+.4f}  refined_tokens={refined_tokens}")
 
+        # Checkpoint
         if (i + 1) % args.checkpoint_interval == 0:
             df.to_csv(output_path, index=False)
             print(f"  Checkpoint saved ({i + 1} samples processed)")
 
+    # =========================================================================
+    # Final save
+    # =========================================================================
     df.to_csv(output_path, index=False)
     print(f"\nResults saved to: {output_path}")
 
+    # =========================================================================
+    # Summary
+    # =========================================================================
     processed_df = df.iloc[start_idx:end_idx]
     valid_scores = processed_df[args.score_column].dropna()
 
@@ -886,6 +977,7 @@ Examples:
         print(f"Min Cosine Similarity: {valid_scores.min():.4f}")
         print(f"Max Cosine Similarity: {valid_scores.max():.4f}")
         print("=" * 80)
+
 
 if __name__ == "__main__":
     main()

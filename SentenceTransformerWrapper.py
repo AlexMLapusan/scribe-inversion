@@ -13,6 +13,7 @@ class SentenceTransformerWrapper:
         for param in self.model.parameters():
             param.requires_grad = False
 
+        # Token counting infrastructure
         self.tokenizer = self.model.tokenizer
         self.total_tokens_embedded = 0
 
@@ -52,6 +53,7 @@ class SentenceTransformerWrapper:
         else:
             texts_list = texts
 
+        # Count tokens before encoding
         self._count_and_accumulate_tokens(texts_list)
 
         with torch.no_grad():
@@ -66,8 +68,10 @@ class SentenceTransformerWrapper:
     def get_gradual_embeddings(self, texts, chunk_size=1, prompt_name=None):
         embeddings = {}
         chunked_texts = {}
+        # Loop through each text in texts
         for text_index, text in enumerate(texts):
             text_words = (text.split(' '))
+            # Generate chunks from the text
             chunks = [text_words[0: chunk_size * (j + 1)] for j in range(len(text_words) // chunk_size)]
             embeddings[text_index] = {}
             chunked_texts[text_index] = {}
@@ -75,6 +79,7 @@ class SentenceTransformerWrapper:
             for chunk_index, chunk in enumerate(chunks):
                 chunk_text = " ".join(chunk)
                 chunked_texts[text_index][chunk_index] = chunk_text
+                # Count tokens before encoding
                 self._count_and_accumulate_tokens([chunk_text])
                 with torch.no_grad():
                     if prompt_name:
